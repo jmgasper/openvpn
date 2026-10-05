@@ -1272,6 +1272,12 @@ do_ifconfig_ipv6(struct tuntap *tt, const char *ifname, int tun_mtu,
             do_dns_domain_wmic(true, tt);
         }
     }
+#elif defined(TARGET_HAIKU)
+    /* example: ifconfig tun/0 inet6 fd00::2 prefixlen 64 up */
+    argv_printf(&argv, "%s %s inet6 %s prefixlen %d up", IFCONFIG_PATH,
+                ifname, ifconfig_ipv6_local, tt->netbits_ipv6);
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, es, S_FATAL, "Haiku ifconfig inet6 failed");
 #else /* platforms we have no IPv6 code for */
     msg(M_FATAL, "Sorry, but I don't know how to do IPv6 'ifconfig' commands on this operating system.  You should ifconfig your TUN/TAP device manually or use an --up script.");
 #endif /* outer "if defined(TARGET_xxx)" conditional */
@@ -1638,9 +1644,19 @@ do_ifconfig_ipv4(struct tuntap *tt, const char *ifname, int tun_mtu,
         windows_set_mtu(tt->adapter_index, AF_INET, tun_mtu);
     }
 #elif defined(TARGET_HAIKU)
-    /* example: ifconfig tun/0 inet 1.1.1.1 255.255.255.0 mtu 1450 up */
-    argv_printf(&argv, "%s %s inet %s %s mtu %d up", IFCONFIG_PATH,
-                ifname, ifconfig_local, ifconfig_remote_netmask, tun_mtu);
+    if (tun)
+    {
+        /* example: ifconfig tun/0 inet 10.8.0.6 255.255.255.255 peer 10.8.0.5 mtu 1450 up */
+        argv_printf(&argv, "%s %s inet %s 255.255.255.255 peer %s mtu %d up",
+                    IFCONFIG_PATH, ifname, ifconfig_local,
+                    ifconfig_remote_netmask, tun_mtu);
+    }
+    else
+    {
+        /* example: ifconfig tun/0 inet 1.1.1.1 255.255.255.0 mtu 1450 up */
+        argv_printf(&argv, "%s %s inet %s %s mtu %d up", IFCONFIG_PATH,
+                    ifname, ifconfig_local, ifconfig_remote_netmask, tun_mtu);
+    }
 
     argv_msg(M_INFO, &argv);
     openvpn_execve_check(&argv, es, S_FATAL, "Haiku ifconfig failed");
@@ -7175,6 +7191,154 @@ print_windows_driver(enum windows_driver_type windows_driver)
         default:
             return "unspecified";
     }
+}
+
+#elif defined(TARGET_HAIKU)
+
+/*
+ * Haiku's tunnel driver publishes /dev/tun/<n> (or /dev/tap/<n>) once an
+ * interface of that name is added to the network stack, and it serves at
+ * most 10 units. Add the first free unit ourselves and remove it again when
+ * done, so no manual "ifconfig tun/0 up" is needed. Units that existed
+ * before are used as they are and kept; units whose interface was removed
+ * but which the stack still keeps for lingering sockets are skipped.
+ */
+#define HAIKU_TUNNEL_UNITS 10
+
+static bool
+haiku_add_interface(const char *name)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+    {
+        return false;
+    }
+
+    struct ifaliasreq request;
+    CLEAR(request);
+    strncpynt(request.ifra_name, name, sizeof(request.ifra_name));
+    bool ok = ioctl(fd, SIOCAIFADDR, &request, sizeof(request)) == 0;
+    if (!ok)
+    {
+        msg(M_WARN | M_ERRNO, "Could not add network interface %s", name);
+    }
+    close(fd);
+    return ok;
+}
+
+static void
+haiku_remove_interface(const char *name)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+    {
+        return;
+    }
+
+    struct ifreq request;
+    CLEAR(request);
+    strncpynt(request.ifr_name, name, sizeof(request.ifr_name));
+    request.ifr_addr.sa_family = AF_UNSPEC;
+    if (ioctl(fd, SIOCDIFADDR, &request, sizeof(request)) != 0)
+    {
+        msg(M_WARN | M_ERRNO, "Could not remove network interface %s", name);
+    }
+    else
+    {
+        msg(M_INFO, "Removed network interface %s", name);
+    }
+    close(fd);
+}
+
+void
+open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tuntap *tt,
+         openvpn_net_ctx_t *ctx)
+{
+    if (tt->type == DEV_TYPE_NULL || dev_node || tun_name_is_fixed(dev))
+    {
+        open_tun_generic(dev, dev_type, dev_node, tt);
+        return;
+    }
+
+    for (int i = 0; i < HAIKU_TUNNEL_UNITS; ++i)
+    {
+        char name[IF_NAMESIZE];
+        char path[IF_NAMESIZE + 8];
+        openvpn_snprintf(name, sizeof(name), "%s/%d", dev, i);
+        openvpn_snprintf(path, sizeof(path), "/dev/%s", name);
+
+        bool created = false;
+        if (access(path, F_OK) != 0)
+        {
+            if (!haiku_add_interface(name))
+            {
+                continue;
+            }
+            created = true;
+        }
+        else if (if_nametoindex(name) == 0)
+        {
+            /* The interface is gone but the stack keeps the unit until the
+             * sockets that used its address (TCP TIME_WAIT) have closed. */
+            msg(M_INFO, "Skipping %s: its interface is still being removed", path);
+            continue;
+        }
+
+        tt->fd = open(path, O_RDWR);
+        if (tt->fd < 0)
+        {
+            /* busy: another tunnel owns this unit */
+            msg(D_READ_WRITE | M_ERRNO, "Tried opening %s (failed)", path);
+            if (created)
+            {
+                haiku_remove_interface(name);
+            }
+            continue;
+        }
+
+        tt->persistent_if = !created;
+        set_nonblock(tt->fd);
+        set_cloexec(tt->fd); /* don't pass fd to scripts */
+        msg(M_INFO, "TUN/TAP device %s opened%s", path,
+            created ? " (created)" : "");
+        tt->actual_name = string_alloc(name, NULL);
+        return;
+    }
+
+    msg(M_FATAL, "Cannot allocate TUN/TAP dev dynamically");
+}
+
+void
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
+{
+    ASSERT(tt);
+
+    char *name = NULL;
+    if (tt->actual_name && !tt->persistent_if)
+    {
+        name = string_alloc(tt->actual_name, NULL);
+    }
+
+    /* the driver refuses to remove a unit that is still open */
+    close_tun_generic(tt);
+    if (name)
+    {
+        haiku_remove_interface(name);
+        free(name);
+    }
+    free(tt);
+}
+
+int
+write_tun(struct tuntap *tt, uint8_t *buf, int len)
+{
+    return write(tt->fd, buf, len);
+}
+
+int
+read_tun(struct tuntap *tt, uint8_t *buf, int len)
+{
+    return read(tt->fd, buf, len);
 }
 
 #else /* generic */
