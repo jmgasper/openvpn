@@ -2245,7 +2245,7 @@ man_read(struct management *man)
     /*
      * read command line from socket
      */
-    unsigned char buf[256];
+    unsigned char buf[MANAGEMENT_SOCKET_READ_BUFFER_SIZE];
     int len = 0;
 
 #ifdef TARGET_ANDROID
@@ -2336,7 +2336,7 @@ man_read(struct management *man)
 static int
 man_write(struct management *man)
 {
-    const int size_hint = 1024;
+    const int size_hint = 8192;
     int sent = 0;
     const struct buffer *buf;
 
@@ -2581,7 +2581,7 @@ man_connection_init(struct management *man)
          * Allocate helper objects for command line input and
          * command output from/to the socket.
          */
-        man->connection.in = command_line_new(1024);
+        man->connection.in = command_line_new(COMMAND_LINE_OPTION_BUFFER_SIZE);
         man->connection.out = buffer_list_new();
 
         /*
